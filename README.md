@@ -1,4 +1,4 @@
-![Screenshot](https://i.imgur.com/E4xrpDo.png)
+
 
 # Web Technology Detection Tool
 
