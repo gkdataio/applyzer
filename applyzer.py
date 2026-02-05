@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from Wappalyzer import Wappalyzer, WebPage
 import requests
 import urllib3
 import argparse
-import warnings
 import socket
 import json
 import csv
@@ -14,7 +17,6 @@ import os
 import time
 import threading
 
-warnings.filterwarnings("ignore", category=UserWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Colors ---
