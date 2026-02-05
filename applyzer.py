@@ -6,6 +6,7 @@ import requests
 import urllib3
 import argparse
 import warnings
+import socket
 import json
 import csv
 import sys
@@ -51,8 +52,53 @@ _lock = threading.Lock()
 _progress = {"done": 0, "total": 0}
 
 
+def dns_resolve(hostname):
+    """Quick DNS check. Returns True if hostname resolves."""
+    try:
+        socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def classify_error(e):
+    """Extract a short, readable error message from an exception."""
+    msg = str(e)
+    if "NameResolutionError" in msg or "getaddrinfo failed" in msg or "Name or service not known" in msg:
+        return "DNS resolution failed"
+    if "ConnectTimeoutError" in msg or "timed out" in msg.lower():
+        return "Connection timed out"
+    if "ConnectionRefusedError" in msg or "Connection refused" in msg:
+        return "Connection refused"
+    if "SSLError" in msg or "SSL" in msg:
+        return "SSL/TLS error"
+    if "TooManyRedirects" in msg:
+        return "Too many redirects"
+    if "ConnectionResetError" in msg or "Connection reset" in msg:
+        return "Connection reset by host"
+    if "Max retries exceeded" in msg:
+        # Strip the verbose wrapper, keep inner cause
+        if "Caused by" in msg:
+            inner = msg.split("Caused by ")[-1].rstrip(")")
+            return classify_error(Exception(inner))
+        return "Max retries exceeded"
+    # Fallback: truncate long messages
+    if len(msg) > 80:
+        return msg[:77] + "..."
+    return msg
+
+
+def _make_request(url, headers, timeout, verify_ssl):
+    """Make a single HTTP request and return a WebPage."""
+    response = requests.get(
+        url, headers=headers, timeout=timeout,
+        verify=verify_ssl, allow_redirects=True
+    )
+    return WebPage(response.url, html=response.text, headers=response.headers)
+
+
 def fetch_webpage(url, ua, timeout=10, verify_ssl=False, retries=2):
-    """Fetch a webpage with custom User-Agent and retry logic."""
+    """Fetch a webpage with custom User-Agent, retry logic, and HTTP fallback."""
     headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -61,15 +107,35 @@ def fetch_webpage(url, ua, timeout=10, verify_ssl=False, retries=2):
         "Connection": "keep-alive",
     }
 
+    # Quick DNS pre-check to skip retries on dead hosts
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    hostname = parsed.hostname or url.replace("https://", "").replace("http://", "").split("/")[0]
+    if not dns_resolve(hostname):
+        raise ConnectionError("DNS resolution failed")
+
     last_err = None
     for attempt in range(retries + 1):
         try:
-            response = requests.get(
-                url, headers=headers, timeout=timeout,
-                verify=verify_ssl, allow_redirects=True
-            )
-            return WebPage(response.url, html=response.text, headers=response.headers)
+            return _make_request(url, headers, timeout, verify_ssl)
+        except requests.exceptions.SSLError:
+            # HTTPS failed with SSL error — try HTTP fallback
+            if url.startswith("https://"):
+                http_url = "http://" + url[8:]
+                try:
+                    return _make_request(http_url, headers, timeout, verify_ssl)
+                except Exception:
+                    pass
+            last_err = ConnectionError("SSL/TLS error (HTTP fallback also failed)")
+            break
         except requests.exceptions.ConnectionError as e:
+            # If it's a non-DNS connection error, try HTTP fallback on last attempt
+            if attempt == retries and url.startswith("https://"):
+                http_url = "http://" + url[8:]
+                try:
+                    return _make_request(http_url, headers, timeout, verify_ssl)
+                except Exception:
+                    pass
             last_err = e
             if attempt < retries:
                 time.sleep(1 * (attempt + 1))
@@ -186,8 +252,9 @@ def write_results(results, output_path, fmt):
                 f.write(format_tech_plain(r["url"], r["technologies"]) + "\n")
 
 
-def print_summary(results):
-    """Print a summary of all detected technologies."""
+def print_summary(results, errors):
+    """Print a summary of all detected technologies and errors."""
+    total_scanned = len(results) + len(errors)
     all_tech = {}
     for r in results:
         for name, info in r["technologies"].items():
@@ -195,23 +262,33 @@ def print_summary(results):
                 all_tech[name] = {"count": 0, "categories": info.get("categories", [])}
             all_tech[name]["count"] += 1
 
-    if not all_tech:
-        return
-
     print(f"\n{PURPLE}{'─' * 50}{END}")
     print(f"{PURPLE}{BOLD} Summary{END}")
     print(f"{PURPLE}{'─' * 50}{END}")
-    print(f"  Domains scanned: {BOLD}{len(results)}{END}")
-    print(f"  Unique technologies: {BOLD}{len(all_tech)}{END}")
+    print(f"  Targets:      {BOLD}{total_scanned}{END}")
+    print(f"  Successful:   {GREEN}{BOLD}{len(results)}{END}")
+    print(f"  Failed:       {PURPLE}{BOLD}{len(errors)}{END}")
+    if all_tech:
+        print(f"  Technologies: {BOLD}{len(all_tech)}{END} unique")
+
+    # Error breakdown
+    if errors:
+        err_types = {}
+        for e in errors:
+            reason = e["error"]
+            err_types[reason] = err_types.get(reason, 0) + 1
+        print(f"\n  {BOLD}Errors:{END}")
+        for reason, count in sorted(err_types.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {PURPLE}{count:>4}x{END} {reason}")
 
     # Top technologies by frequency
-    sorted_tech = sorted(all_tech.items(), key=lambda x: x[1]["count"], reverse=True)
-    top = sorted_tech[:10]
-    if top:
+    if all_tech:
+        sorted_tech = sorted(all_tech.items(), key=lambda x: x[1]["count"], reverse=True)
+        top = sorted_tech[:10]
         print(f"\n  {BOLD}Most common:{END}")
         for name, info in top:
             cats = f" {DIM}({', '.join(info['categories'])}){END}" if info["categories"] else ""
-            bar = "█" * info["count"]
+            bar = "█" * min(info["count"], 30)
             print(f"    {GREEN}{bar}{END} {name}{cats} ({info['count']})")
 
 
@@ -295,9 +372,10 @@ def main():
                     _progress["done"] += 1
                     count = _progress["done"]
                     total = _progress["total"]
-                errors.append({"domain": domain, "error": str(e)})
+                short_err = classify_error(e)
+                errors.append({"domain": domain, "error": short_err})
                 if not args.ignore:
-                    print(f"  {PURPLE}[{count}/{total}] Error:{END} {BOLD}{domain}{END} > {DIM}{str(e)}{END}")
+                    print(f"  {PURPLE}[{count}/{total}] Error:{END} {BOLD}{domain}{END} > {DIM}{short_err}{END}")
 
     # Write output file
     if args.output and results:
@@ -305,11 +383,7 @@ def main():
         print(f"\n  {GREEN}Results saved to:{END} {BOLD}{args.output}{END}")
 
     # Print summary
-    print_summary(results)
-
-    # Show error count if any
-    if errors:
-        print(f"\n  {PURPLE}Failed:{END} {len(errors)} domain(s)")
+    print_summary(results, errors)
 
 
 if __name__ == "__main__":
