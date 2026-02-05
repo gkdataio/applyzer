@@ -1,74 +1,316 @@
-from concurrent.futures import ThreadPoolExecutor as Executor  # pip install futures
-from Wappalyzer import Wappalyzer, WebPage  # pip install python-Wappalyzer
-import urllib3, argparse, warnings
+#!/usr/bin/env python3
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from Wappalyzer import Wappalyzer, WebPage
+import requests
+import urllib3
+import argparse
+import warnings
+import json
+import csv
+import sys
+import os
+import time
+import threading
 
 warnings.filterwarnings("ignore", category=UserWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # disable Python SSL warnings!
+# --- Colors ---
+GREEN = "\033[38;5;120m"
+BLUE = "\033[38;5;81m"
+PURPLE = "\033[38;5;99m"
+YELLOW = "\033[38;5;228m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+END = "\033[0m"
 
-pastel_green = "\033[38;5;120m"
-pastel_blue = "\033[38;5;81m"
-pastel_purple = "\033[38;5;99m"
-bold = "\033[1m"
-end = "\033[0m"
+BANNER = f"""{BLUE}
+                 _
+  __ _ _ __ _ __| |_  _ ______ _ _
+ / _` | '_ \\ '_ \\ | || |_ / -_) '_|
+ \\__,_| .__/ .__/_|\\_, /__\\___|_|
+      |_|  |_|     |__/   @gkdata
+{END}"""
 
-wappalyzer = Wappalyzer.latest()
+# User-Agent strings to rotate through for WAF evasion
+USER_AGENTS = [
+    # Googlebot
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/131.0.6778.135 Safari/537.36",
+    # Bingbot
+    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+    # Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+]
 
-print(pastel_blue + """
-                 _                 
-  __ _ _ __ _ __| |_  _ ______ _ _ 
- / _` | '_ \ '_ \ | || |_ / -_) '_|
- \__,_| .__/ .__/_|\_, /__\___|_|  
-      |_|  |_|     |__/   @gkdata        
-	""" + end)
+# Thread-safe counter for progress
+_lock = threading.Lock()
+_progress = {"done": 0, "total": 0}
 
-def check(out, ig, url):
-    if not url.startswith('https'):
-        url = 'https://' + url
-    try:
-        webpage = WebPage.new_from_url(url)
-        tech = wappalyzer.analyze(webpage)
-        print(f"{pastel_green}[+]{end} {url} | {pastel_blue}{bold}{' - '.join(tech)}{end}")
-        if out != 'None':
-            with open(out, 'a') as f:
-                f.write(f"{url} | {' - '.join(tech)}\n")
-    except Exception as e:
-        if ig == 'True':
-            pass
+
+def fetch_webpage(url, ua, timeout=10, verify_ssl=False, retries=2):
+    """Fetch a webpage with custom User-Agent and retry logic."""
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    }
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(
+                url, headers=headers, timeout=timeout,
+                verify=verify_ssl, allow_redirects=True
+            )
+            return WebPage(response.url, html=response.text, headers=response.headers)
+        except requests.exceptions.ConnectionError as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1 * (attempt + 1))
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1 * (attempt + 1))
+        except Exception as e:
+            raise e
+
+    raise last_err
+
+
+def get_ua(index, mode="googlebot"):
+    """Get a User-Agent string based on mode."""
+    if mode == "googlebot":
+        return USER_AGENTS[index % 2]  # Rotate between Googlebot UAs
+    elif mode == "bingbot":
+        return USER_AGENTS[2]
+    elif mode == "chrome":
+        return USER_AGENTS[3]
+    elif mode == "firefox":
+        return USER_AGENTS[4]
+    elif mode == "rotate":
+        return USER_AGENTS[index % len(USER_AGENTS)]
+    else:
+        return USER_AGENTS[0]
+
+
+def format_tech_plain(url, tech_dict):
+    """Format technology results as a plain text line."""
+    parts = []
+    for name, info in sorted(tech_dict.items()):
+        versions = info.get("versions", [])
+        if versions:
+            parts.append(f"{name} ({', '.join(versions)})")
         else:
-            print(f"{pastel_purple}Error:{end} [ {bold}{url}{end} ] > {str(e)}")
+            parts.append(name)
+    return f"{url} | {' - '.join(parts)}" if parts else f"{url} | No technologies detected"
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-d", "--domain", help="Single domain to analyze", type=str)
-parser.add_argument("-f", "--file", help="File containing list of domains to analyze", type=str)
-parser.add_argument("-t", "--thread", help="Threads Number - (Default: 1)", type=int, default=1)
-parser.add_argument("-i", "--ignore", help="To Ignore The Errors", action='store_true')
-parser.add_argument("-o", "--output", help="Save The Results To a File", type=str)
 
-args = parser.parse_args()
+def format_tech_console(url, tech_dict):
+    """Format technology results for colorized console output."""
+    parts = []
+    for name, info in sorted(tech_dict.items()):
+        categories = info.get("categories", [])
+        versions = info.get("versions", [])
+        cat_str = f"{DIM}[{', '.join(categories)}]{END}" if categories else ""
+        ver_str = f" {YELLOW}{', '.join(versions)}{END}" if versions else ""
+        parts.append(f"{BLUE}{BOLD}{name}{END}{ver_str} {cat_str}")
+    return parts
 
-threads = args.thread
-ig = str(args.ignore)
-out = str(args.output)
-domains = []
 
-# Read from file if provided
-if args.file:
-    with open(args.file, 'r') as file:
-        domains = [line.strip() for line in file]
-elif args.domain:
-    domains.append(args.domain)
-else:
-    print("Please provide a domain or a file containing domains.")
-    exit(1)
+def check(wappalyzer, url, ua, timeout, verify_ssl, retries):
+    """Analyze a single URL and return results."""
+    if not url.startswith("http"):
+        url = "https://" + url
 
-print(f"{pastel_green}[+]{end} Output: {out}")
-print(f"{pastel_green}[+]{end} Threads: {threads}")
-print(f"{pastel_green}[+]{end} Ignore: {ig}")
+    webpage = fetch_webpage(url, ua, timeout=timeout, verify_ssl=verify_ssl, retries=retries)
+    tech = wappalyzer.analyze_with_versions_and_categories(webpage)
 
-print(f"\n{pastel_purple}[+]{end} Results:\n")
+    with _lock:
+        _progress["done"] += 1
+        count = _progress["done"]
+        total = _progress["total"]
 
-with Executor(max_workers=int(threads)) as exe:
-    for domain in domains:
-        print(f"{pastel_green}[+]{end} Domain: {domain}")
-        exe.submit(check, out, ig, domain)
+    tech_parts = format_tech_console(url, tech)
+    if tech_parts:
+        tech_line = ", ".join(tech_parts)
+    else:
+        tech_line = f"{DIM}No technologies detected{END}"
+
+    print(f"  {GREEN}[{count}/{total}]{END} {BOLD}{url}{END}")
+    print(f"         {tech_line}")
+
+    return {"url": url, "technologies": tech}
+
+
+def write_results(results, output_path, fmt):
+    """Write results to a file in the specified format."""
+    if fmt == "json":
+        # Build clean JSON structure
+        data = []
+        for r in results:
+            entry = {"url": r["url"], "technologies": []}
+            for name, info in sorted(r["technologies"].items()):
+                entry["technologies"].append({
+                    "name": name,
+                    "versions": info.get("versions", []),
+                    "categories": info.get("categories", []),
+                })
+            data.append(entry)
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    elif fmt == "csv":
+        with open(output_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["URL", "Technology", "Version", "Categories"])
+            for r in results:
+                if not r["technologies"]:
+                    writer.writerow([r["url"], "", "", ""])
+                for name, info in sorted(r["technologies"].items()):
+                    writer.writerow([
+                        r["url"],
+                        name,
+                        "; ".join(info.get("versions", [])),
+                        "; ".join(info.get("categories", [])),
+                    ])
+
+    else:  # txt (default)
+        with open(output_path, "w") as f:
+            for r in results:
+                f.write(format_tech_plain(r["url"], r["technologies"]) + "\n")
+
+
+def print_summary(results):
+    """Print a summary of all detected technologies."""
+    all_tech = {}
+    for r in results:
+        for name, info in r["technologies"].items():
+            if name not in all_tech:
+                all_tech[name] = {"count": 0, "categories": info.get("categories", [])}
+            all_tech[name]["count"] += 1
+
+    if not all_tech:
+        return
+
+    print(f"\n{PURPLE}{'─' * 50}{END}")
+    print(f"{PURPLE}{BOLD} Summary{END}")
+    print(f"{PURPLE}{'─' * 50}{END}")
+    print(f"  Domains scanned: {BOLD}{len(results)}{END}")
+    print(f"  Unique technologies: {BOLD}{len(all_tech)}{END}")
+
+    # Top technologies by frequency
+    sorted_tech = sorted(all_tech.items(), key=lambda x: x[1]["count"], reverse=True)
+    top = sorted_tech[:10]
+    if top:
+        print(f"\n  {BOLD}Most common:{END}")
+        for name, info in top:
+            cats = f" {DIM}({', '.join(info['categories'])}){END}" if info["categories"] else ""
+            bar = "█" * info["count"]
+            print(f"    {GREEN}{bar}{END} {name}{cats} ({info['count']})")
+
+
+def main():
+    print(BANNER)
+
+    parser = argparse.ArgumentParser(
+        description="Web technology detection tool powered by Wappalyzer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-d", "--domain", help="Single domain to analyze", type=str)
+    parser.add_argument("-f", "--file", help="File containing list of domains (one per line)", type=str)
+    parser.add_argument("-t", "--threads", help="Number of concurrent threads (default: 5)", type=int, default=5)
+    parser.add_argument("-o", "--output", help="Save results to file", type=str)
+    parser.add_argument("-F", "--format", help="Output format: txt, json, csv (default: txt)",
+                        choices=["txt", "json", "csv"], default="txt")
+    parser.add_argument("-T", "--timeout", help="Request timeout in seconds (default: 10)", type=int, default=10)
+    parser.add_argument("-r", "--retries", help="Number of retries per domain (default: 2)", type=int, default=2)
+    parser.add_argument("-i", "--ignore", help="Suppress error messages", action="store_true")
+    parser.add_argument("--ua", help="User-Agent mode: googlebot, bingbot, chrome, firefox, rotate (default: googlebot)",
+                        default="googlebot", choices=["googlebot", "bingbot", "chrome", "firefox", "rotate"])
+    parser.add_argument("--verify-ssl", help="Verify SSL certificates", action="store_true")
+
+    args = parser.parse_args()
+
+    # Load domains
+    domains = []
+    if args.file:
+        if not os.path.isfile(args.file):
+            print(f"{PURPLE}Error:{END} File not found: {args.file}")
+            sys.exit(1)
+        with open(args.file, "r") as f:
+            domains = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    elif args.domain:
+        domains.append(args.domain)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    if not domains:
+        print(f"{PURPLE}Error:{END} No domains to analyze.")
+        sys.exit(1)
+
+    # Show config
+    print(f"  {GREEN}Targets:{END}    {BOLD}{len(domains)}{END} domain(s)")
+    print(f"  {GREEN}Threads:{END}    {BOLD}{args.threads}{END}")
+    print(f"  {GREEN}User-Agent:{END} {BOLD}{args.ua}{END}")
+    print(f"  {GREEN}Timeout:{END}    {BOLD}{args.timeout}s{END}")
+    if args.output:
+        print(f"  {GREEN}Output:{END}     {BOLD}{args.output}{END} ({args.format})")
+    print()
+
+    # Initialize Wappalyzer
+    wappalyzer = Wappalyzer.latest()
+
+    # Set up progress tracking
+    _progress["total"] = len(domains)
+    _progress["done"] = 0
+
+    results = []
+    errors = []
+
+    print(f"{PURPLE}{BOLD} Scanning...{END}\n")
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        future_to_domain = {}
+        for i, domain in enumerate(domains):
+            ua = get_ua(i, args.ua)
+            future = executor.submit(
+                check, wappalyzer, domain, ua, args.timeout, args.verify_ssl, args.retries
+            )
+            future_to_domain[future] = domain
+
+        for future in as_completed(future_to_domain):
+            domain = future_to_domain[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                with _lock:
+                    _progress["done"] += 1
+                    count = _progress["done"]
+                    total = _progress["total"]
+                errors.append({"domain": domain, "error": str(e)})
+                if not args.ignore:
+                    print(f"  {PURPLE}[{count}/{total}] Error:{END} {BOLD}{domain}{END} > {DIM}{str(e)}{END}")
+
+    # Write output file
+    if args.output and results:
+        write_results(results, args.output, args.format)
+        print(f"\n  {GREEN}Results saved to:{END} {BOLD}{args.output}{END}")
+
+    # Print summary
+    print_summary(results)
+
+    # Show error count if any
+    if errors:
+        print(f"\n  {PURPLE}Failed:{END} {len(errors)} domain(s)")
+
+
+if __name__ == "__main__":
+    main()
